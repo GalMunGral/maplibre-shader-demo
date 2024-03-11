@@ -1,0 +1,203 @@
+<head>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/maplibre-gl/dist/maplibre-gl.css"
+  />
+  <script src="https://unpkg.com/maplibre-gl/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/earcut@2.2.4/dist/earcut.min.js"></script>
+</head>
+<body>
+  <div
+    id="map"
+    style="position: fixed; left: 0; right: 0; top: 0; bottom: 0"
+  ></div>
+  <script defer>
+    const vertexSource = `#version 300 es
+      uniform mat4 u_matrix;
+      uniform float t;
+
+      in vec2 pos;
+      in float state_idx;
+      in float tri_idx;
+
+      out float vt;
+      out float si;
+      out float vi;
+
+      void main() {
+          float i = mod(float(gl_VertexID), 50.0);
+          float phi = 0.01 * i * t + 10.0;
+          float amp = 0.0002 * i * (0.5 + 0.5 * sin(0.1 * t));
+          float z = amp * (0.5 * sin(phi) + 0.5);
+          gl_Position = u_matrix * vec4(pos, z, 1.0);
+          vt = t;
+          si = state_idx;
+          vi = i;
+      }
+      `;
+
+    const fragmentSource = `#version 300 es
+      precision mediump float;
+
+      #define PI 3.1415926538
+
+      in float vt;
+      in float si;
+      in float vi;
+
+      out highp vec4 fragColor;
+
+      void main() {
+          float t = (0.5 + 0.002 * vi) * vt + 0.01 * si + 0.001 * vi;
+          fragColor = vec4(
+              0.3 + 0.3 * sin(t + 1.333 * PI),
+              0.3 + 0.3 * sin(t + 0.666 * PI),
+              0.3 + 0.3 * sin(t),
+              0.3
+          );
+      }
+    `;
+
+    (async function init() {
+      const vertices = [];
+      const stateIndex = [];
+      const triangles = [];
+      const geojson = await (await fetch("./states.json")).json();
+      let t = 0;
+
+      for (let [j, feature] of geojson.features.entries()) {
+        const polys =
+          feature.geometry.type === "Polygon"
+            ? [feature.geometry.coordinates]
+            : feature.geometry.type === "MultiPolygon"
+            ? feature.geometry.coordinates
+            : [];
+        for (let poly of polys) {
+          const data = earcut.flatten(poly);
+          const indices = earcut(data.vertices, data.holes, data.dimensions);
+          const vertexIndexOffset = vertices.length / 2;
+          triangles.push(...indices.map((i) => i + vertexIndexOffset));
+          for (let i = 0; i < data.vertices.length; i += 2) {
+            const { x, y } = maplibregl.MercatorCoordinate.fromLngLat({
+              lng: data.vertices[i],
+              lat: data.vertices[i + 1],
+            });
+            vertices.push(x, y);
+            stateIndex.push(j);
+          }
+        }
+      }
+
+      let program = null;
+      let vertexBuffer = null;
+      let stateIndexBuffer = null;
+      let indexBuffer = null;
+      let aPos = -1;
+      let aStateIndex = -1;
+
+      const highlightLayer = {
+        id: "highlight",
+        type: "custom",
+
+        onAdd(_, gl) {
+          const vertexShader = gl.createShader(gl.VERTEX_SHADER);
+          gl.shaderSource(vertexShader, vertexSource);
+          gl.compileShader(vertexShader);
+          console.log(gl.getShaderInfoLog(vertexShader));
+
+          const fragmentShader = gl.createShader(gl.FRAGMENT_SHADER);
+          gl.shaderSource(fragmentShader, fragmentSource);
+          gl.compileShader(fragmentShader);
+          console.log(gl.getShaderInfoLog(fragmentShader));
+
+          program = gl.createProgram();
+          gl.attachShader(program, vertexShader);
+          gl.attachShader(program, fragmentShader);
+          gl.linkProgram(program);
+
+          aPos = gl.getAttribLocation(program, "pos");
+          aStateIndex = gl.getAttribLocation(program, "state_idx");
+
+          vertexBuffer = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+          gl.bufferData(
+            gl.ARRAY_BUFFER,
+            new Float32Array(vertices),
+            gl.STATIC_DRAW
+          );
+
+          stateIndexBuffer = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, stateIndexBuffer);
+          gl.bufferData(
+            gl.ARRAY_BUFFER,
+            new Float32Array(stateIndex),
+            gl.STATIC_DRAW
+          );
+
+          indexBuffer = gl.createBuffer();
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+          gl.bufferData(
+            gl.ELEMENT_ARRAY_BUFFER,
+            new Uint16Array(triangles),
+            gl.STATIC_DRAW
+          );
+        },
+
+        render(gl, matrix) {
+          gl.useProgram(program);
+          gl.uniformMatrix4fv(
+            gl.getUniformLocation(program, "u_matrix"),
+            false,
+            matrix
+          );
+          gl.uniform1f(gl.getUniformLocation(program, "t"), (t += 0.1));
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, vertexBuffer);
+          gl.enableVertexAttribArray(aPos);
+          gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, stateIndexBuffer);
+          gl.enableVertexAttribArray(aStateIndex);
+          gl.vertexAttribPointer(aStateIndex, 1, gl.FLOAT, false, 0, 0);
+
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+          gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+          gl.drawElements(gl.TRIANGLES, triangles.length, gl.UNSIGNED_SHORT, 0);
+          map.triggerRepaint();
+          return true;
+        },
+      };
+
+      const map = new maplibregl.Map({
+        container: "map",
+        center: [-100, 40],
+        bearing: -44.8,
+        pitch: 60,
+        zoom: 3,
+        style: {
+          version: 8,
+          sources: {
+            World_Imagery: {
+              type: "raster",
+              tileSize: 256,
+              tiles: [
+                "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+              ],
+            },
+          },
+          layers: [
+            {
+              id: "World_Imagery",
+              source: "World_Imagery",
+              type: "raster",
+            },
+          ],
+        },
+      });
+      map.on("load", () => {
+        map.addLayer(highlightLayer);
+      });
+    })();
+  </script>
+</body>
